@@ -153,6 +153,69 @@ func (c *Client) SetDefault(ctx context.Context, printer string) error {
 	return nil
 }
 
+// PausePrinter pauses a printer queue via cupsdisable <printer>.
+func (c *Client) PausePrinter(ctx context.Context, printer string) error {
+	_, err := c.r.Run(ctx, "cupsdisable", printer)
+	if err != nil {
+		return fmt.Errorf("cupsdisable %s failed: %w", printer, err)
+	}
+	return nil
+}
+
+// ResumePrinter resumes a printer queue via cupsenable <printer>.
+func (c *Client) ResumePrinter(ctx context.Context, printer string) error {
+	_, err := c.r.Run(ctx, "cupsenable", printer)
+	if err != nil {
+		return fmt.Errorf("cupsenable %s failed: %w", printer, err)
+	}
+	return nil
+}
+
+// DeletePrinter deletes a printer queue via lpadmin -x <printer>.
+func (c *Client) DeletePrinter(ctx context.Context, printer string) error {
+	_, err := c.r.Run(ctx, "lpadmin", "-x", printer)
+	if err != nil {
+		return fmt.Errorf("lpadmin -x %s failed: %w", printer, err)
+	}
+	return nil
+}
+
+// RenamePrinter recreates a queue with a new name and removes the old queue.
+func (c *Client) RenamePrinter(ctx context.Context, oldName, newName, deviceURI string, isDefault bool) error {
+	if newName == "" || newName == oldName {
+		return fmt.Errorf("invalid new printer name: %q", newName)
+	}
+	if deviceURI == "" {
+		vOut, err := c.r.Run(ctx, "lpstat", "-v")
+		if err == nil {
+			uris := ParseDeviceURIs(string(vOut))
+			deviceURI = uris[oldName]
+		}
+	}
+	if deviceURI == "" {
+		return fmt.Errorf("cannot rename %s: unable to resolve device URI", oldName)
+	}
+
+	// 1. Create new queue: lpadmin -p <newName> -E -v <deviceURI> -m everywhere
+	_, err := c.r.Run(ctx, "lpadmin", "-p", newName, "-E", "-v", deviceURI, "-m", "everywhere")
+	if err != nil {
+		return fmt.Errorf("lpadmin create %s failed: %w", newName, err)
+	}
+
+	// 2. Transfer default status if old printer was default
+	if isDefault {
+		_ = c.SetDefault(ctx, newName)
+	}
+
+	// 3. Remove old queue: lpadmin -x <oldName>
+	_, err = c.r.Run(ctx, "lpadmin", "-x", oldName)
+	if err != nil {
+		return fmt.Errorf("lpadmin delete %s failed: %w", oldName, err)
+	}
+
+	return nil
+}
+
 // Regex patterns for parsing lpstat outputs.
 var (
 	// printer Brother_Printer is idle.  enabled since Tue 10 Nov 2026 12:28:52 PM EST

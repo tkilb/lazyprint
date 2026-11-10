@@ -109,3 +109,96 @@ func TestModel_ViewRenderingWithData(t *testing.T) {
 	assert.Contains(t, viewScanners, "HL-L2395DW series")
 	assert.Contains(t, viewScanners, "flatbed scanner")
 }
+
+func TestModel_PrinterActions_And_Modals(t *testing.T) {
+	cfg := config.Default()
+	mock := runner.NewMockRunner()
+	mock.Register("lpoptions -d Brother_Printer", []byte(""), nil)
+	mock.Register("cupsdisable Brother_Printer", []byte(""), nil)
+	mock.Register("lpadmin -x Brother_Printer", []byte(""), nil)
+	mock.Register("lpadmin -p New_Brother -E -v ipp://brother.local -m everywhere", []byte(""), nil)
+
+	m := app.NewModel(cfg, mock)
+	m.Focus = statusbar.PanelPrinters
+	m.Printers = []cups.Printer{
+		{
+			Name:      "Brother_Printer",
+			Status:    cups.StatusIdle,
+			Enabled:   true,
+			DeviceURI: "ipp://brother.local",
+			IsDefault: false,
+		},
+	}
+
+	// 1. Set default ('d')
+	mUpdated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	require.NotNil(t, cmd)
+	m = mUpdated.(app.Model)
+
+	// 2. Pause queue (' ')
+	mUpdated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	require.NotNil(t, cmd)
+	m = mUpdated.(app.Model)
+
+	// 3. Delete queue prompt ('x')
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = mUpdated.(app.Model)
+	assert.Contains(t, m.View(), "Delete printer queue")
+
+	// Cancel deletion ('n')
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	m = mUpdated.(app.Model)
+	assert.NotContains(t, m.View(), "Delete printer queue")
+
+	// Confirm deletion ('x' then 'y')
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = mUpdated.(app.Model)
+	mUpdated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	require.NotNil(t, cmd)
+	m = mUpdated.(app.Model)
+
+	// 4. Rename prompt ('R')
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("R")})
+	m = mUpdated.(app.Model)
+	assert.Contains(t, m.View(), "Rename Printer")
+
+	// Cancel rename ('esc')
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	m = mUpdated.(app.Model)
+	assert.NotContains(t, m.View(), "Rename Printer")
+}
+
+func TestModel_JobActions_And_Modals(t *testing.T) {
+	cfg := config.Default()
+	mock := runner.NewMockRunner()
+	mock.Register("cancel Brother_Printer-42", []byte(""), nil)
+	mock.Register("cancel -a", []byte(""), nil)
+
+	m := app.NewModel(cfg, mock)
+	m.Focus = statusbar.PanelJobs
+	m.Jobs = []cups.Job{
+		{
+			ID:      "Brother_Printer-42",
+			Printer: "Brother_Printer",
+		},
+	}
+
+	// 1. Cancel job confirmation ('x')
+	mUpdated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = mUpdated.(app.Model)
+	assert.Contains(t, m.View(), "Cancel print job Brother_Printer-42?")
+
+	// Confirm cancel ('y')
+	mUpdated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	require.NotNil(t, cmd)
+	m = mUpdated.(app.Model)
+
+	// 2. Purge jobs confirmation ('X')
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("X")})
+	m = mUpdated.(app.Model)
+	assert.Contains(t, m.View(), "Purge all active print jobs")
+
+	// Confirm purge ('y')
+	mUpdated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	require.NotNil(t, cmd)
+}

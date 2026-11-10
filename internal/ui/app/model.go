@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/tkilb/lazyprint/internal/config"
@@ -14,8 +15,24 @@ import (
 	"github.com/tkilb/lazyprint/internal/runner"
 	"github.com/tkilb/lazyprint/internal/sane"
 	"github.com/tkilb/lazyprint/internal/ui/panel"
+	"github.com/tkilb/lazyprint/internal/ui/popup"
 	"github.com/tkilb/lazyprint/internal/ui/statusbar"
 )
+
+type actionType int
+
+const (
+	actionNone actionType = iota
+	actionDeletePrinter
+	actionCancelJob
+	actionPurgeJobs
+)
+
+type actionCompletedMsg struct {
+	message string
+	err     error
+	refresh bool
+}
 
 type focusCycle []statusbar.PanelID
 
@@ -78,6 +95,17 @@ type Model struct {
 	LoadingPrinters bool
 	LoadingJobs     bool
 	LoadingScanners bool
+
+	// Popups and actions
+	Popups        popup.Model
+	ConfirmAction actionType
+	ConfirmText   string
+	DangerConfirm bool
+
+	// Rename prompt modal
+	Renaming     bool
+	RenameTarget cups.Printer
+	RenameInput  textinput.Model
 }
 
 // NewModel creates an initialized Model with the provided configuration and runner.
@@ -87,6 +115,10 @@ func NewModel(cfg config.Config, r runner.Runner) Model {
 	}
 	cupsClient := cups.NewClient(r)
 	saneClient := sane.NewClient(r)
+
+	ti := textinput.New()
+	ti.Placeholder = "new-printer-name"
+	ti.CharLimit = 64
 
 	return Model{
 		Config:          cfg,
@@ -102,6 +134,7 @@ func NewModel(cfg config.Config, r runner.Runner) Model {
 		LoadingPrinters: true,
 		LoadingJobs:     true,
 		LoadingScanners: true,
+		RenameInput:     ti,
 	}
 }
 
@@ -228,7 +261,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case scannerCapsMsg:
 		m.ScannerCaps[msg.device] = msg.caps
 
+	case actionCompletedMsg:
+		if msg.err != nil {
+			m.Popups = m.Popups.Push(popup.Message{Severity: popup.Error, Text: msg.err.Error()})
+		} else if msg.message != "" {
+			m.StatusBar.SetMessage(msg.message, false)
+		}
+		if msg.refresh {
+			cmds = append(cmds, m.fetchPrintersCmd(), m.fetchJobsCmd())
+		}
+
 	case tea.KeyMsg:
+		if m.Popups.Active() {
+			m.Popups = m.Popups.Dismiss()
+			return m, nil
+		}
+
+		if m.ConfirmAction != actionNone {
+			switch msg.String() {
+			case "y", "enter":
+				actionCmd := m.executeConfirmAction()
+				m.ConfirmAction = actionNone
+				m.ConfirmText = ""
+				m.DangerConfirm = false
+				return m, actionCmd
+			case "n", "esc", "q":
+				m.ConfirmAction = actionNone
+				m.ConfirmText = ""
+				m.DangerConfirm = false
+				return m, nil
+			}
+			return m, nil
+		}
+
+		if m.Renaming {
+			switch msg.String() {
+			case "esc":
+				m.Renaming = false
+				m.RenameInput.Blur()
+				return m, nil
+			case "enter":
+				renameCmd := m.confirmRename()
+				m.Renaming = false
+				m.RenameInput.Blur()
+				return m, renameCmd
+			}
+			var tiCmd tea.Cmd
+			m.RenameInput, tiCmd = m.RenameInput.Update(msg)
+			return m, tiCmd
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -258,6 +340,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.moveCursorDown(&cmds)
 		case "k", "up":
 			m.moveCursorUp(&cmds)
+
+		case "d":
+			if m.Focus == statusbar.PanelPrinters && len(m.Printers) > 0 {
+				cmds = append(cmds, m.setDefaultPrinterCmd())
+			}
+		case " ":
+			if m.Focus == statusbar.PanelPrinters && len(m.Printers) > 0 {
+				cmds = append(cmds, m.togglePausePrinterCmd())
+			}
+		case "x":
+			if m.Focus == statusbar.PanelPrinters && len(m.Printers) > 0 {
+				target := m.Printers[m.PrinterCursor]
+				m.ConfirmAction = actionDeletePrinter
+				m.ConfirmText = fmt.Sprintf("Delete printer queue %q?", target.Name)
+				m.DangerConfirm = true
+			} else if m.Focus == statusbar.PanelJobs && len(m.Jobs) > 0 {
+				target := m.Jobs[m.JobCursor]
+				m.ConfirmAction = actionCancelJob
+				m.ConfirmText = fmt.Sprintf("Cancel print job %s?", target.ID)
+				m.DangerConfirm = false
+			}
+		case "X":
+			if m.Focus == statusbar.PanelJobs && len(m.Jobs) > 0 {
+				m.ConfirmAction = actionPurgeJobs
+				m.ConfirmText = "Purge all active print jobs in the queue?"
+				m.DangerConfirm = true
+			}
+		case "R", "e":
+			if m.Focus == statusbar.PanelPrinters && len(m.Printers) > 0 {
+				target := m.Printers[m.PrinterCursor]
+				m.Renaming = true
+				m.RenameTarget = target
+				m.RenameInput.SetValue(target.Name)
+				m.RenameInput.Focus()
+			}
 		}
 
 	case tea.MouseMsg:
@@ -407,6 +524,106 @@ func (m *Model) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	return nil
 }
 
+func (m *Model) setDefaultPrinterCmd() tea.Cmd {
+	printer := m.Printers[m.PrinterCursor].Name
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := m.CUPS.SetDefault(ctx, printer)
+		if err != nil {
+			return actionCompletedMsg{err: err}
+		}
+		return actionCompletedMsg{message: fmt.Sprintf("Default printer set to %s", printer), refresh: true}
+	}
+}
+
+func (m *Model) togglePausePrinterCmd() tea.Cmd {
+	target := m.Printers[m.PrinterCursor]
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if target.Status == cups.StatusDisabled || !target.Enabled {
+			err := m.CUPS.ResumePrinter(ctx, target.Name)
+			if err != nil {
+				return actionCompletedMsg{err: err}
+			}
+			return actionCompletedMsg{message: fmt.Sprintf("Resumed printer %s", target.Name), refresh: true}
+		} else {
+			err := m.CUPS.PausePrinter(ctx, target.Name)
+			if err != nil {
+				return actionCompletedMsg{err: err}
+			}
+			return actionCompletedMsg{message: fmt.Sprintf("Paused printer %s", target.Name), refresh: true}
+		}
+	}
+}
+
+func (m *Model) executeConfirmAction() tea.Cmd {
+	switch m.ConfirmAction {
+	case actionDeletePrinter:
+		if len(m.Printers) == 0 || m.PrinterCursor >= len(m.Printers) {
+			return nil
+		}
+		target := m.Printers[m.PrinterCursor].Name
+		return func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := m.CUPS.DeletePrinter(ctx, target)
+			if err != nil {
+				return actionCompletedMsg{err: err}
+			}
+			return actionCompletedMsg{message: fmt.Sprintf("Deleted printer %s", target), refresh: true}
+		}
+
+	case actionCancelJob:
+		if len(m.Jobs) == 0 || m.JobCursor >= len(m.Jobs) {
+			return nil
+		}
+		target := m.Jobs[m.JobCursor].ID
+		return func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := m.CUPS.CancelJob(ctx, target)
+			if err != nil {
+				return actionCompletedMsg{err: err}
+			}
+			return actionCompletedMsg{message: fmt.Sprintf("Cancelled job %s", target), refresh: true}
+		}
+
+	case actionPurgeJobs:
+		return func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := m.CUPS.CancelAll(ctx, "")
+			if err != nil {
+				return actionCompletedMsg{err: err}
+			}
+			return actionCompletedMsg{message: "Purged all queue jobs", refresh: true}
+		}
+	}
+	return nil
+}
+
+func (m *Model) confirmRename() tea.Cmd {
+	oldName := m.RenameTarget.Name
+	newName := strings.TrimSpace(m.RenameInput.Value())
+	if newName == "" || newName == oldName {
+		return nil
+	}
+	uri := m.RenameTarget.DeviceURI
+	isDefault := m.RenameTarget.IsDefault
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		err := m.CUPS.RenamePrinter(ctx, oldName, newName, uri, isDefault)
+		if err != nil {
+			return actionCompletedMsg{err: err}
+		}
+		return actionCompletedMsg{message: fmt.Sprintf("Renamed %s to %s", oldName, newName), refresh: true}
+	}
+}
+
 func (m Model) calculateLayout() (leftWidth, p1H, p2H, p3H int) {
 	statusH := 1
 	usableH := max(8, m.Height-statusH)
@@ -428,7 +645,7 @@ func (m Model) calculateLayout() (leftWidth, p1H, p2H, p3H int) {
 	return leftWidth, p1H, p2H, p3H
 }
 
-// View renders the 2-column grid and status bar.
+// View renders the 2-column grid and status bar, with active modal popups overlaid.
 func (m Model) View() string {
 	leftWidth, p1H, p2H, p3H := m.calculateLayout()
 	rightWidth := max(20, m.Width-leftWidth)
@@ -445,7 +662,30 @@ func (m Model) View() string {
 	grid := lipgloss.JoinHorizontal(lipgloss.Top, leftCol, rightCol)
 	status := m.StatusBar.View(m.Focus)
 
-	return lipgloss.JoinVertical(lipgloss.Left, grid, status)
+	baseView := lipgloss.JoinVertical(lipgloss.Left, grid, status)
+
+	if m.Renaming {
+		box := popup.PromptBox("Rename Printer", fmt.Sprintf("Enter new queue name for %s:", m.RenameTarget.Name), m.RenameInput.View(), m.Width)
+		return popup.Overlay(baseView, box, m.Width, m.Height)
+	}
+
+	if m.ConfirmAction != actionNone {
+		var box string
+		if m.DangerConfirm {
+			box = popup.DangerConfirmBox(m.ConfirmText, m.Width)
+		} else {
+			box = popup.ConfirmBox(m.ConfirmText, m.Width)
+		}
+		return popup.Overlay(baseView, box, m.Width, m.Height)
+	}
+
+	if m.Popups.Active() {
+		msg, _ := m.Popups.Current()
+		box := popup.Box(msg, m.Width)
+		return popup.Overlay(baseView, box, m.Width, m.Height)
+	}
+
+	return baseView
 }
 
 func (m Model) renderPrintersPanel(width, height int) string {

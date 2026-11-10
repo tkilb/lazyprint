@@ -146,6 +146,11 @@ func TestClient_IsolatedExecution(t *testing.T) {
 	mock.Register("lpoptions -p Brother_Printer -l", []byte(optionsFixture), nil)
 	mock.Register("cancel Brother_Printer-42", []byte(""), nil)
 	mock.Register("cancel -a Brother_Printer", []byte(""), nil)
+	mock.Register("cupsdisable Brother_Printer", []byte(""), nil)
+	mock.Register("cupsenable Brother_Printer", []byte(""), nil)
+	mock.Register("lpadmin -x Brother_Printer", []byte(""), nil)
+	mock.Register("lpadmin -p Brother_Office -E -v ipp://Brother%20HL-L2395DW%20series._ipp._tcp.local/ -m everywhere", []byte(""), nil)
+	mock.Register("lpoptions -d Brother_Office", []byte(""), nil)
 	mock.Register("lpoptions -d Brother_Printer", []byte(""), nil)
 
 	t.Run("GetPrinters", func(t *testing.T) {
@@ -183,6 +188,26 @@ func TestClient_IsolatedExecution(t *testing.T) {
 
 	t.Run("SetDefault", func(t *testing.T) {
 		err := client.SetDefault(ctx, "Brother_Printer")
+		require.NoError(t, err)
+	})
+
+	t.Run("PausePrinter", func(t *testing.T) {
+		err := client.PausePrinter(ctx, "Brother_Printer")
+		require.NoError(t, err)
+	})
+
+	t.Run("ResumePrinter", func(t *testing.T) {
+		err := client.ResumePrinter(ctx, "Brother_Printer")
+		require.NoError(t, err)
+	})
+
+	t.Run("DeletePrinter", func(t *testing.T) {
+		err := client.DeletePrinter(ctx, "Brother_Printer")
+		require.NoError(t, err)
+	})
+
+	t.Run("RenamePrinter", func(t *testing.T) {
+		err := client.RenamePrinter(ctx, "Brother_Printer", "Brother_Office", "ipp://Brother%20HL-L2395DW%20series._ipp._tcp.local/", true)
 		require.NoError(t, err)
 	})
 
