@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/tkilb/lazyprint/internal/config"
 	"github.com/tkilb/lazyprint/internal/runner"
+	"github.com/tkilb/lazyprint/internal/ui/app"
 	"github.com/tkilb/lazyprint/internal/version"
 )
 
@@ -26,8 +28,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	_ = cfg
-	_ = runner.NewRealRunner()
+	r := runner.NewRealRunner()
+	model := app.NewModel(cfg, r)
 
-	fmt.Println("lazyprint - CUPS & SANE TUI")
+	opts := []tea.ProgramOption{
+		tea.WithAltScreen(),
+	}
+	if cfg.UI.Mouse {
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
+
+	p := tea.NewProgram(model, opts...)
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error running lazyprint: %v\n", err)
+		os.Exit(1)
+	}
 }
