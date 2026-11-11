@@ -22,7 +22,7 @@ const (
 // Default settings.
 const (
 	DefaultScanDirResolution = 300
-	DefaultScanFormat        = "pdf"
+	DefaultScanFormat        = "png"
 	DefaultScanSource        = "flatbed"
 	DefaultPrintCopies       = 1
 	DefaultPrintDuplex       = "off"
@@ -43,11 +43,17 @@ type ScanConfig struct {
 	// DefaultResolution is the default DPI (e.g. 150, 300, 600). Defaults to 300.
 	DefaultResolution int `yaml:"default_resolution"`
 
-	// DefaultFormat is the default file extension / format (pdf, png, jpeg). Defaults to "pdf".
+	// DefaultFormat is the default file extension / format (png, pdf, jpeg) or MIME type (e.g. image/png). Defaults to "png".
 	DefaultFormat string `yaml:"default_format"`
 
 	// DefaultSource is the scan input source (flatbed, adf). Defaults to "flatbed".
 	DefaultSource string `yaml:"default_source"`
+
+	// DefaultMode is the scan color mode ("Color", "Gray", "Lineart"). Defaults to "Color".
+	DefaultMode string `yaml:"default_mode"`
+
+	// AutoCrop automatically trims blank margins around scanned items. Defaults to true.
+	AutoCrop bool `yaml:"auto_crop"`
 }
 
 // PrintConfig defines printing preferences.
@@ -79,6 +85,8 @@ func Default() Config {
 			DefaultResolution: DefaultScanDirResolution,
 			DefaultFormat:     DefaultScanFormat,
 			DefaultSource:     DefaultScanSource,
+			DefaultMode:       "Color",
+			AutoCrop:          true,
 		},
 		Print: PrintConfig{
 			DefaultCopies: DefaultPrintCopies,
@@ -152,6 +160,26 @@ func Load(path string) (Config, error) {
 	return LoadFromReader(f)
 }
 
+// NormalizeFormat standardizes file formats and MIME types to canonical lowercase extensions
+// (e.g., "image/png" -> "png", "application/pdf" -> "pdf", "image/jpeg" -> "jpeg").
+func NormalizeFormat(f string) string {
+	switch strings.ToLower(strings.TrimSpace(f)) {
+	case "image/png", "png", ".png":
+		return "png"
+	case "application/pdf", "pdf", ".pdf":
+		return "pdf"
+	case "image/jpeg", "image/jpg", "jpeg", "jpg", ".jpeg", ".jpg":
+		return "jpeg"
+	case "image/tiff", "image/x-tiff", "tiff", "tif", ".tiff", ".tif":
+		return "tiff"
+	case "image/x-portable-anymap", "pnm", ".pnm":
+		return "pnm"
+	default:
+		clean := strings.ToLower(strings.TrimSpace(f))
+		return strings.TrimPrefix(clean, ".")
+	}
+}
+
 // LoadFromReader parses YAML configuration from an io.Reader and merges onto defaults.
 func LoadFromReader(r io.Reader) (Config, error) {
 	cfg := Default()
@@ -161,5 +189,6 @@ func LoadFromReader(r io.Reader) (Config, error) {
 	}
 
 	cfg.Scan.SaveDir = ExpandHome(cfg.Scan.SaveDir)
+	cfg.Scan.DefaultFormat = NormalizeFormat(cfg.Scan.DefaultFormat)
 	return cfg, nil
 }

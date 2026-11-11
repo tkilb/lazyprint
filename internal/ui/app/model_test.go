@@ -1,6 +1,7 @@
 package app_test
 
 import (
+	"context"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -201,4 +202,116 @@ func TestModel_JobActions_And_Modals(t *testing.T) {
 	// Confirm purge ('y')
 	mUpdated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
 	require.NotNil(t, cmd)
+}
+
+func TestModel_ScanningActions_And_Modal(t *testing.T) {
+	cfg := config.Default()
+	mock := runner.NewMockRunner()
+	mock.RegisterLookPath("magick", "/usr/bin/magick")
+	mock.SetDefaultHandler(func(_ context.Context, _ runner.ExecCommand) (runner.Result, error) {
+		return runner.Result{ExitCode: 0}, nil
+	})
+
+	m := app.NewModel(cfg, mock)
+	m.Focus = statusbar.PanelScanners
+	m.Scanners = []sane.Device{
+		{
+			Device: "airscan:e0:Brother",
+			Model:  "Brother HL-L2395DW",
+			Type:   "flatbed scanner",
+		},
+	}
+	m.ScannerCaps["airscan:e0:Brother"] = sane.Capabilities{
+		Resolutions:   []int{150, 300, 600},
+		Sources:       []string{"Flatbed", "ADF"},
+		HasADF:        true,
+	}
+
+	// 1. Open scan modal ('s')
+	mUpdated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	m = mUpdated.(app.Model)
+	assert.True(t, m.ScanningModal)
+	assert.Contains(t, m.View(), "Scan: Brother HL-L2395DW")
+
+	// Navigate to resolution and change it with 'l'
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = mUpdated.(app.Model)
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = mUpdated.(app.Model)
+
+	// Default format is png; resolution changed to 600
+	// 2. Confirm scan in modal ('enter')
+	mUpdated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = mUpdated.(app.Model)
+	assert.False(t, m.ScanningModal)
+	assert.True(t, m.Scanning)
+	require.NotNil(t, cmd)
+	assert.Contains(t, m.View(), "Scanning to")
+	assert.Equal(t, 600, m.LastScanResolution)
+	assert.Equal(t, "png", m.LastScanFormat)
+
+	// Verify next modal open inherits remembered settings
+	m.Scanning = false
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	m = mUpdated.(app.Model)
+	assert.True(t, m.ScanningModal)
+	req := m.ScanModal.Request()
+	assert.Equal(t, 600, req.Resolution)
+	assert.Equal(t, "png", req.Format)
+
+	// Change format to jpeg and resolution to 150, then press Esc
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown}) // resolution
+	m = mUpdated.(app.Model)
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")}) // 600 -> 300
+	m = mUpdated.(app.Model)
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")}) // 300 -> 150
+	m = mUpdated.(app.Model)
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown}) // mode
+	m = mUpdated.(app.Model)
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown}) // format
+	m = mUpdated.(app.Model)
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")}) // png -> jpeg
+	m = mUpdated.(app.Model)
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = mUpdated.(app.Model)
+	assert.False(t, m.ScanningModal)
+	assert.Equal(t, 150, m.LastScanResolution)
+	assert.Equal(t, "jpeg", m.LastScanFormat)
+
+	// Re-open modal and confirm 150 DPI and jpeg are remembered after Esc
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	m = mUpdated.(app.Model)
+	assert.True(t, m.ScanningModal)
+	req = m.ScanModal.Request()
+	assert.Equal(t, 150, req.Resolution)
+	assert.Equal(t, "jpeg", req.Format)
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = mUpdated.(app.Model)
+
+	// 3. Quick Scan Flatbed ('f')
+	m.Scanning = false
+	mUpdated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+	m = mUpdated.(app.Model)
+	assert.True(t, m.Scanning)
+	require.NotNil(t, cmd)
+
+	// 4. Quick Scan ADF ('a') with ADF-capable scanner
+	m.Scanning = false
+	mUpdated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = mUpdated.(app.Model)
+	assert.True(t, m.Scanning)
+	require.NotNil(t, cmd)
+
+	// 5. Quick Scan ADF ('a') on device without ADF
+	m.Scanning = false
+	m.ScannerCaps["airscan:e0:Brother"] = sane.Capabilities{
+		Resolutions: []int{300},
+		Sources:     []string{"Flatbed"},
+		HasADF:      false,
+	}
+	mUpdated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = mUpdated.(app.Model)
+	assert.False(t, m.Scanning)
+	assert.Nil(t, cmd)
+	assert.Contains(t, m.StatusBar.Message, "does not support ADF")
 }

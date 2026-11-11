@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tkilb/lazyprint/internal/config"
 	"github.com/tkilb/lazyprint/internal/runner"
 )
 
@@ -38,10 +39,11 @@ type Capabilities struct {
 type ScanRequest struct {
 	Device     string `json:"device"`
 	Resolution int    `json:"resolution"`
-	Source     string `json:"source"`     // e.g. "Flatbed", "ADF"
-	Format     string `json:"format"`     // "pdf", "png", "jpeg"
-	Mode       string `json:"mode"`       // "Color", "Gray"
+	Source     string `json:"source"` // e.g. "Flatbed", "ADF"
+	Format     string `json:"format"` // "pdf", "png", "jpeg"
+	Mode       string `json:"mode"`   // "Color", "Gray"
 	OutputPath string `json:"output_path"`
+	AutoCrop   bool   `json:"auto_crop"`
 }
 
 // Client wraps SANE CLI interactions using runner.Runner.
@@ -85,7 +87,29 @@ func (c *Client) Scan(ctx context.Context, req ScanRequest) error {
 	if err != nil {
 		return fmt.Errorf("scanimage failed: %w", err)
 	}
+
+	if req.AutoCrop && req.OutputPath != "" {
+		if err := c.AutoCrop(ctx, req.OutputPath, req.Resolution); err != nil {
+			return fmt.Errorf("autocrop failed: %w", err)
+		}
+	}
+
 	return nil
+}
+
+// AutoCrop trims empty scanner bed margins around the scanned item.
+func (c *Client) AutoCrop(ctx context.Context, filePath string, resolution int) error {
+	return c.AutoCropFile(ctx, filePath, resolution)
+}
+
+// BuildAutoCropArgs constructs argv for trimming blank borders with magick or convert.
+func BuildAutoCropArgs(filePath string, resolution int) []string {
+	var args []string
+	if strings.EqualFold(filepath.Ext(filePath), ".pdf") && resolution > 0 {
+		args = append(args, "-density", strconv.Itoa(resolution))
+	}
+	args = append(args, filePath, "-fuzz", "10%", "-trim", "+repage", filePath)
+	return args
 }
 
 // BuildScanArgs constructs the argv slice for `scanimage`.
@@ -104,7 +128,7 @@ func BuildScanArgs(req ScanRequest) []string {
 		args = append(args, "--mode", req.Mode)
 	}
 	if req.Format != "" {
-		args = append(args, "--format="+strings.ToLower(req.Format))
+		args = append(args, "--format="+config.NormalizeFormat(req.Format))
 	}
 	if req.OutputPath != "" {
 		args = append(args, "-o", req.OutputPath)
@@ -114,9 +138,9 @@ func BuildScanArgs(req ScanRequest) []string {
 
 // GenerateFilename generates a default autosave filename: scan_YYYYMMDD_HHMMSS.<ext>.
 func GenerateFilename(ext string, now time.Time) string {
-	cleanExt := strings.TrimPrefix(ext, ".")
+	cleanExt := config.NormalizeFormat(ext)
 	if cleanExt == "" {
-		cleanExt = "pdf"
+		cleanExt = config.DefaultScanFormat
 	}
 	return fmt.Sprintf("scan_%s.%s", now.Format("20060102_150405"), cleanExt)
 }

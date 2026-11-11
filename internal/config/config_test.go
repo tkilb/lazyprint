@@ -15,8 +15,9 @@ func TestConfig_DefaultValues(t *testing.T) {
 	cfg := config.Default()
 
 	assert.Equal(t, 300, cfg.Scan.DefaultResolution)
-	assert.Equal(t, "pdf", cfg.Scan.DefaultFormat)
+	assert.Equal(t, "png", cfg.Scan.DefaultFormat)
 	assert.Equal(t, "flatbed", cfg.Scan.DefaultSource)
+	assert.True(t, cfg.Scan.AutoCrop)
 	assert.Equal(t, 1, cfg.Print.DefaultCopies)
 	assert.Equal(t, "off", cfg.Print.DefaultDuplex)
 	assert.True(t, cfg.UI.Mouse)
@@ -38,7 +39,7 @@ func TestConfig_LoadFromReader(t *testing.T) {
 			yaml: "",
 			validate: func(t *testing.T, cfg config.Config) {
 				assert.Equal(t, 300, cfg.Scan.DefaultResolution)
-				assert.Equal(t, "pdf", cfg.Scan.DefaultFormat)
+				assert.Equal(t, "png", cfg.Scan.DefaultFormat)
 			},
 		},
 		{
@@ -47,7 +48,7 @@ func TestConfig_LoadFromReader(t *testing.T) {
 scan:
   save_dir: /custom/scans
   default_resolution: 600
-  default_format: png
+  default_format: pdf
   default_source: adf
 print:
   default_copies: 2
@@ -58,7 +59,7 @@ ui:
 			validate: func(t *testing.T, cfg config.Config) {
 				assert.Equal(t, "/custom/scans", cfg.Scan.SaveDir)
 				assert.Equal(t, 600, cfg.Scan.DefaultResolution)
-				assert.Equal(t, "png", cfg.Scan.DefaultFormat)
+				assert.Equal(t, "pdf", cfg.Scan.DefaultFormat)
 				assert.Equal(t, "adf", cfg.Scan.DefaultSource)
 				assert.Equal(t, 2, cfg.Print.DefaultCopies)
 				assert.Equal(t, "long-edge", cfg.Print.DefaultDuplex)
@@ -73,9 +74,19 @@ scan:
 `,
 			validate: func(t *testing.T, cfg config.Config) {
 				assert.Equal(t, 150, cfg.Scan.DefaultResolution)
-				assert.Equal(t, "pdf", cfg.Scan.DefaultFormat)
+				assert.Equal(t, "png", cfg.Scan.DefaultFormat)
 				assert.Equal(t, 1, cfg.Print.DefaultCopies)
 				assert.True(t, cfg.UI.Mouse)
+			},
+		},
+		{
+			name: "mime type normalization for default_format",
+			yaml: `
+scan:
+  default_format: image/png
+`,
+			validate: func(t *testing.T, cfg config.Config) {
+				assert.Equal(t, "png", cfg.Scan.DefaultFormat)
 			},
 		},
 	}
@@ -105,7 +116,40 @@ scan:
 	require.NoError(t, err)
 	assert.Equal(t, "/tmp/scans", cfg.Scan.SaveDir)
 	assert.Equal(t, 1200, cfg.Scan.DefaultResolution)
-	assert.Equal(t, "pdf", cfg.Scan.DefaultFormat)
+	assert.Equal(t, "png", cfg.Scan.DefaultFormat)
+}
+
+func TestConfig_NormalizeFormat(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"image/png", "png"},
+		{"png", "png"},
+		{".png", "png"},
+		{"PNG", "png"},
+		{"application/pdf", "pdf"},
+		{"pdf", "pdf"},
+		{".pdf", "pdf"},
+		{"PDF", "pdf"},
+		{"image/jpeg", "jpeg"},
+		{"image/jpg", "jpeg"},
+		{"jpeg", "jpeg"},
+		{"jpg", "jpeg"},
+		{".jpg", "jpeg"},
+		{"image/tiff", "tiff"},
+		{"tiff", "tiff"},
+		{".tif", "tiff"},
+		{"image/x-portable-anymap", "pnm"},
+		{"pnm", "pnm"},
+		{"", ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			assert.Equal(t, tc.expected, config.NormalizeFormat(tc.input))
+		})
+	}
 }
 
 func TestConfig_ExpandHome(t *testing.T) {

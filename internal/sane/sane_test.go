@@ -1,8 +1,11 @@
 package sane_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"image"
+	"image/png"
 	"testing"
 	"time"
 
@@ -106,6 +109,21 @@ func TestBuildScanArgs(t *testing.T) {
 			},
 		},
 		{
+			name: "mime type format normalization",
+			req: sane.ScanRequest{
+				Device:     "airscan:e0:Brother",
+				Resolution: 300,
+				Format:     "image/png",
+				OutputPath: "/tmp/scans/test.png",
+			},
+			expected: []string{
+				"-d", "airscan:e0:Brother",
+				"--resolution", "300",
+				"--format=png",
+				"-o", "/tmp/scans/test.png",
+			},
+		},
+		{
 			name: "minimal options",
 			req: sane.ScanRequest{
 				Device:     "genesys:libusb",
@@ -131,6 +149,12 @@ func TestFilenameGeneration(t *testing.T) {
 	name := sane.GenerateFilename("pdf", fixedTime)
 	assert.Equal(t, "scan_20261110_150405.pdf", name)
 
+	defaultName := sane.GenerateFilename("", fixedTime)
+	assert.Equal(t, "scan_20261110_150405.png", defaultName)
+
+	mimeName := sane.GenerateFilename("image/png", fixedTime)
+	assert.Equal(t, "scan_20261110_150405.png", mimeName)
+
 	path := sane.BuildDefaultOutputPath("/home/user/Scans", ".png", fixedTime)
 	assert.Equal(t, "/home/user/Scans/scan_20261110_150405.png", path)
 }
@@ -143,6 +167,7 @@ func TestClient_IsolatedExecution(t *testing.T) {
 	mock.Register("scanimage -L", []byte(scanimageLFixture), nil)
 	mock.Register("scanimage --help -d airscan:e0:Brother HL-L2395DW series", []byte(scanimageHelpFlatbedFixture), nil)
 	mock.Register("scanimage -d airscan:e0:Brother --resolution 300 --source Flatbed --format=pdf -o /tmp/scan.pdf", []byte(""), nil)
+	mock.RegisterLookPath("magick", "/usr/bin/magick")
 
 	t.Run("GetDevices", func(t *testing.T) {
 		devices, err := client.GetDevices(ctx)
@@ -167,6 +192,32 @@ func TestClient_IsolatedExecution(t *testing.T) {
 			OutputPath: "/tmp/scan.pdf",
 		})
 		require.NoError(t, err)
+	})
+
+	t.Run("Scan execution with AutoCrop", func(t *testing.T) {
+		// Mock PNG preview for PDF
+		var buf bytes.Buffer
+		dummyImg := image.NewRGBA(image.Rect(0, 0, 100, 100))
+		require.NoError(t, png.Encode(&buf, dummyImg))
+
+		mock.Register("magick -density 72 /tmp/scan.pdf[0] png:-", buf.Bytes(), nil)
+		err := client.Scan(ctx, sane.ScanRequest{
+			Device:     "airscan:e0:Brother",
+			Resolution: 300,
+			Source:     "Flatbed",
+			Format:     "pdf",
+			OutputPath: "/tmp/scan.pdf",
+			AutoCrop:   true,
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("BuildAutoCropArgs", func(t *testing.T) {
+		pdfArgs := sane.BuildAutoCropArgs("/tmp/doc.pdf", 300)
+		assert.Equal(t, []string{"-density", "300", "/tmp/doc.pdf", "-fuzz", "10%", "-trim", "+repage", "/tmp/doc.pdf"}, pdfArgs)
+
+		imgArgs := sane.BuildAutoCropArgs("/tmp/photo.png", 600)
+		assert.Equal(t, []string{"/tmp/photo.png", "-fuzz", "10%", "-trim", "+repage", "/tmp/photo.png"}, imgArgs)
 	})
 
 	t.Run("Scan error propagation", func(t *testing.T) {

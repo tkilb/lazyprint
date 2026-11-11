@@ -4,9 +4,11 @@ package app
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -16,6 +18,7 @@ import (
 	"github.com/tkilb/lazyprint/internal/sane"
 	"github.com/tkilb/lazyprint/internal/ui/panel"
 	"github.com/tkilb/lazyprint/internal/ui/popup"
+	"github.com/tkilb/lazyprint/internal/ui/scanmodal"
 	"github.com/tkilb/lazyprint/internal/ui/statusbar"
 )
 
@@ -32,6 +35,11 @@ type actionCompletedMsg struct {
 	message string
 	err     error
 	refresh bool
+}
+
+type scanCompletedMsg struct {
+	outputPath string
+	err        error
 }
 
 type focusCycle []statusbar.PanelID
@@ -106,6 +114,18 @@ type Model struct {
 	Renaming     bool
 	RenameTarget cups.Printer
 	RenameInput  textinput.Model
+
+	// Scanning modal & progress
+	ScanModal          *scanmodal.Model
+	ScanningModal      bool
+	Scanning           bool
+	ScanningText       string
+	Spinner            spinner.Model
+	LastScanResolution int
+	LastScanFormat     string
+	LastScanSource     string
+	LastScanMode       string
+	LastScanAutoCrop   bool
 }
 
 // NewModel creates an initialized Model with the provided configuration and runner.
@@ -120,27 +140,38 @@ func NewModel(cfg config.Config, r runner.Runner) Model {
 	ti.Placeholder = "new-printer-name"
 	ti.CharLimit = 64
 
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+
 	return Model{
-		Config:          cfg,
-		Runner:          r,
-		CUPS:            cupsClient,
-		SANE:            saneClient,
-		Width:           100,
-		Height:          30,
-		Focus:           statusbar.PanelPrinters,
-		StatusBar:       statusbar.New(),
-		PrinterOptions:  make(map[string][]cups.PrinterOption),
-		ScannerCaps:     make(map[string]sane.Capabilities),
-		LoadingPrinters: true,
-		LoadingJobs:     true,
-		LoadingScanners: true,
-		RenameInput:     ti,
+		Config:             cfg,
+		Runner:             r,
+		CUPS:               cupsClient,
+		SANE:               saneClient,
+		Width:              100,
+		Height:             30,
+		Focus:              statusbar.PanelPrinters,
+		StatusBar:          statusbar.New(),
+		PrinterOptions:     make(map[string][]cups.PrinterOption),
+		ScannerCaps:        make(map[string]sane.Capabilities),
+		LoadingPrinters:    true,
+		LoadingJobs:        true,
+		LoadingScanners:    true,
+		RenameInput:        ti,
+		Spinner:            sp,
+		LastScanResolution: cfg.Scan.DefaultResolution,
+		LastScanFormat:     cfg.Scan.DefaultFormat,
+		LastScanSource:     cfg.Scan.DefaultSource,
+		LastScanMode:       cfg.Scan.DefaultMode,
+		LastScanAutoCrop:   cfg.Scan.AutoCrop,
 	}
 }
 
 // Init triggers initial asynchronous data loads.
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
+		m.Spinner.Tick,
 		m.fetchPrintersCmd(),
 		m.fetchJobsCmd(),
 		m.fetchScannersCmd(),
@@ -149,7 +180,7 @@ func (m Model) Init() tea.Cmd {
 
 func (m Model) fetchPrintersCmd() tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		p, err := m.CUPS.GetPrinters(ctx)
 		return printersMsg{printers: p, err: err}
@@ -158,7 +189,7 @@ func (m Model) fetchPrintersCmd() tea.Cmd {
 
 func (m Model) fetchJobsCmd() tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		j, err := m.CUPS.GetJobs(ctx)
 		return jobsMsg{jobs: j, err: err}
@@ -167,7 +198,7 @@ func (m Model) fetchJobsCmd() tea.Cmd {
 
 func (m Model) fetchScannersCmd() tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
 		s, err := m.SANE.GetDevices(ctx)
 		return scannersMsg{devices: s, err: err}
@@ -176,7 +207,7 @@ func (m Model) fetchScannersCmd() tea.Cmd {
 
 func (m Model) fetchPrinterOptionsCmd(printer string) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		opts, err := m.CUPS.GetOptions(ctx, printer)
 		if err != nil {
@@ -188,7 +219,7 @@ func (m Model) fetchPrinterOptionsCmd(printer string) tea.Cmd {
 
 func (m Model) fetchScannerCapsCmd(device string) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
 		caps, err := m.SANE.GetCapabilities(ctx, device)
 		if err != nil {
@@ -271,6 +302,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.fetchPrintersCmd(), m.fetchJobsCmd())
 		}
 
+	case scanCompletedMsg:
+		m.Scanning = false
+		if msg.err != nil {
+			m.Popups = m.Popups.Push(popup.Message{Severity: popup.Error, Text: "Scan failed: " + msg.err.Error()})
+		} else {
+			m.StatusBar.SetMessage(fmt.Sprintf("Scan saved: %s", msg.outputPath), false)
+		}
+
+	case spinner.TickMsg:
+		if m.Scanning || m.LoadingScanners || m.LoadingPrinters {
+			var cmd tea.Cmd
+			m.Spinner, cmd = m.Spinner.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+
 	case tea.KeyMsg:
 		if m.Popups.Active() {
 			m.Popups = m.Popups.Dismiss()
@@ -311,6 +357,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tiCmd
 		}
 
+		if m.ScanningModal && m.ScanModal != nil {
+			switch msg.String() {
+			case "esc":
+				req := m.ScanModal.Request()
+				m.LastScanResolution = req.Resolution
+				m.LastScanFormat = req.Format
+				m.LastScanSource = req.Source
+				m.LastScanMode = req.Mode
+				m.LastScanAutoCrop = req.AutoCrop
+				m.ScanningModal = false
+				return m, nil
+			case "enter":
+				req := m.ScanModal.Request()
+				m.LastScanResolution = req.Resolution
+				m.LastScanFormat = req.Format
+				m.LastScanSource = req.Source
+				m.LastScanMode = req.Mode
+				m.LastScanAutoCrop = req.AutoCrop
+				m.ScanningModal = false
+				return m, m.startScanCmd(req)
+			default:
+				updatedModal, cmd, keepOpen := m.ScanModal.Update(msg)
+				m.ScanModal = &updatedModal
+				req := m.ScanModal.Request()
+				m.LastScanResolution = req.Resolution
+				m.LastScanFormat = req.Format
+				m.LastScanSource = req.Source
+				m.LastScanMode = req.Mode
+				m.LastScanAutoCrop = req.AutoCrop
+				if !keepOpen {
+					m.ScanningModal = false
+					return m, nil
+				}
+				return m, cmd
+			}
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -334,7 +417,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.LoadingJobs = true
 			m.LoadingScanners = true
 			m.StatusBar.SetMessage("Refreshing devices...", false)
-			cmds = append(cmds, m.fetchPrintersCmd(), m.fetchJobsCmd(), m.fetchScannersCmd())
+			cmds = append(cmds, m.fetchPrintersCmd(), m.fetchJobsCmd(), m.fetchScannersCmd(), m.Spinner.Tick)
 
 		case "j", "down":
 			m.moveCursorDown(&cmds)
@@ -374,6 +457,88 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.RenameTarget = target
 				m.RenameInput.SetValue(target.Name)
 				m.RenameInput.Focus()
+			}
+
+		case "s", "enter":
+			if m.Focus == statusbar.PanelScanners && len(m.Scanners) > 0 {
+				dev := m.Scanners[m.ScannerCursor]
+				caps := m.ScannerCaps[dev.Device]
+				sm := scanmodal.New(dev, caps, m.Config, m.LastScanResolution, m.LastScanFormat, m.LastScanSource, m.LastScanMode, m.LastScanAutoCrop, time.Now())
+				m.ScanModal = &sm
+				m.ScanningModal = true
+			}
+
+		case "f":
+			if m.Focus == statusbar.PanelScanners && len(m.Scanners) > 0 {
+				dev := m.Scanners[m.ScannerCursor]
+				format := config.NormalizeFormat(m.LastScanFormat)
+				if format == "" {
+					format = config.NormalizeFormat(m.Config.Scan.DefaultFormat)
+				}
+				if format == "" {
+					format = config.DefaultScanFormat
+				}
+				res := m.LastScanResolution
+				if res == 0 {
+					res = m.Config.Scan.DefaultResolution
+				}
+				mode := m.LastScanMode
+				if mode == "" {
+					mode = m.Config.Scan.DefaultMode
+				}
+				if mode == "" {
+					mode = "Color"
+				}
+				outPath := sane.BuildDefaultOutputPath(m.Config.Scan.SaveDir, format, time.Now())
+				req := sane.ScanRequest{
+					Device:     dev.Device,
+					Resolution: res,
+					Source:     "Flatbed",
+					Mode:       mode,
+					Format:     format,
+					OutputPath: outPath,
+					AutoCrop:   m.LastScanAutoCrop,
+				}
+				return m, m.startScanCmd(req)
+			}
+
+		case "a":
+			if m.Focus == statusbar.PanelScanners && len(m.Scanners) > 0 {
+				dev := m.Scanners[m.ScannerCursor]
+				caps := m.ScannerCaps[dev.Device]
+				if !caps.HasADF && !strings.Contains(strings.ToLower(dev.Type), "adf") {
+					m.StatusBar.SetMessage("Selected scanner does not support ADF", true)
+					return m, nil
+				}
+				format := config.NormalizeFormat(m.LastScanFormat)
+				if format == "" {
+					format = config.NormalizeFormat(m.Config.Scan.DefaultFormat)
+				}
+				if format == "" {
+					format = config.DefaultScanFormat
+				}
+				res := m.LastScanResolution
+				if res == 0 {
+					res = m.Config.Scan.DefaultResolution
+				}
+				mode := m.LastScanMode
+				if mode == "" {
+					mode = m.Config.Scan.DefaultMode
+				}
+				if mode == "" {
+					mode = "Color"
+				}
+				outPath := sane.BuildDefaultOutputPath(m.Config.Scan.SaveDir, format, time.Now())
+				req := sane.ScanRequest{
+					Device:     dev.Device,
+					Resolution: res,
+					Source:     "ADF",
+					Mode:       mode,
+					Format:     format,
+					OutputPath: outPath,
+					AutoCrop:   m.LastScanAutoCrop,
+				}
+				return m, m.startScanCmd(req)
 			}
 		}
 
@@ -624,6 +789,20 @@ func (m *Model) confirmRename() tea.Cmd {
 	}
 }
 
+func (m *Model) startScanCmd(req sane.ScanRequest) tea.Cmd {
+	m.Scanning = true
+	m.ScanningText = fmt.Sprintf("Scanning to %s...", filepath.Base(req.OutputPath))
+	return tea.Batch(
+		m.Spinner.Tick,
+		func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			err := m.SANE.Scan(ctx, req)
+			return scanCompletedMsg{outputPath: req.OutputPath, err: err}
+		},
+	)
+}
+
 func (m Model) calculateLayout() (leftWidth, p1H, p2H, p3H int) {
 	statusH := 1
 	usableH := max(8, m.Height-statusH)
@@ -666,6 +845,19 @@ func (m Model) View() string {
 
 	if m.Renaming {
 		box := popup.PromptBox("Rename Printer", fmt.Sprintf("Enter new queue name for %s:", m.RenameTarget.Name), m.RenameInput.View(), m.Width)
+		return popup.Overlay(baseView, box, m.Width, m.Height)
+	}
+
+	if m.ScanningModal && m.ScanModal != nil {
+		box := m.ScanModal.View()
+		return popup.Overlay(baseView, box, m.Width, m.Height)
+	}
+
+	if m.Scanning {
+		box := popup.Box(popup.Message{
+			Severity: popup.Info,
+			Text:     m.Spinner.View() + " " + m.ScanningText,
+		}, m.Width)
 		return popup.Overlay(baseView, box, m.Width, m.Height)
 	}
 
@@ -758,7 +950,7 @@ func (m Model) renderScannersPanel(width, height int) string {
 	var rows []string
 
 	if m.LoadingScanners {
-		rows = append(rows, " Discovering scanners...")
+		rows = append(rows, fmt.Sprintf(" %s Discovering scanners...", m.Spinner.View()))
 	} else if len(m.Scanners) == 0 {
 		rows = append(rows, " (no scanners detected)")
 	} else {
