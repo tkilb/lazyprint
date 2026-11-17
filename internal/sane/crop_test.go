@@ -117,6 +117,94 @@ func TestCalculateCropBounds(t *testing.T) {
 		assert.True(t, crop.Dx() >= 918 && crop.Dx() <= 924)
 		assert.True(t, crop.Dy() >= 1198 && crop.Dy() <= 1204)
 	})
+
+	t.Run("handwritten letter with sparse edge words and blank paper margin on scanner base", func(t *testing.T) {
+		// Simulate flatbed 1000x1300 with gray/off-white scanner lid (lum ~218)
+		bed := image.NewRGBA(image.Rect(0, 0, 1000, 1300))
+		lidColor := color.RGBA{R: 220, G: 218, B: 214, A: 255}
+		draw.Draw(bed, bed.Bounds(), &image.Uniform{C: lidColor}, image.Point{}, draw.Src)
+
+		// White letter sheet placed at (0,0) to (820, 1080)
+		paperColor := color.RGBA{R: 250, G: 249, B: 247, A: 255}
+		draw.Draw(bed, image.Rect(0, 0, 820, 1080), &image.Uniform{C: paperColor}, image.Point{}, draw.Src)
+
+		ink := color.RGBA{R: 45, G: 45, B: 50, A: 255}
+		// Salutation near top-left ("Hi" / "Happy Birthday") starting at y=95 (past 8% top strip)
+		draw.Draw(bed, image.Rect(40, 95, 65, 130), &image.Uniform{C: ink}, image.Point{}, draw.Src)
+		draw.Draw(bed, image.Rect(40, 145, 68, 280), &image.Uniform{C: ink}, image.Point{}, draw.Src)
+
+		// Vertical lines of cursive writing with word spaces across the letter body
+		for colX := 110; colX <= 760; colX += 55 {
+			for wordY := 90; wordY < 980; wordY += 75 {
+				// Each word is a short 35px stroke separated by a 40px gap (fails old 4% straight-run filter)
+				draw.Draw(bed, image.Rect(colX, wordY, colX+4, wordY+35), &image.Uniform{C: ink}, image.Point{}, draw.Src)
+			}
+		}
+
+		// Rightmost line of handwriting at x=775..785 (near right edge of 820px paper)
+		for wordY := 120; wordY < 1010; wordY += 80 {
+			draw.Draw(bed, image.Rect(775, wordY, 780, wordY+32), &image.Uniform{C: ink}, image.Point{}, draw.Src)
+		}
+
+		crop := sane.CalculateCropBounds(bed)
+		// Top-left origin must stay anchored at (0,0) — never slicing off top salutation at y=95
+		assert.Equal(t, 0, crop.Min.X)
+		assert.Equal(t, 0, crop.Min.Y)
+		// Must preserve full paper width (~820) past the rightmost handwriting at x=780, while cropping scanner base (820..1000)
+		assert.True(t, crop.Max.X >= 815 && crop.Max.X <= 826, "expected full letter width ~820 preserved, got %d", crop.Max.X)
+		assert.True(t, crop.Max.Y >= 1075 && crop.Max.Y <= 1086, "expected full letter height ~1080 preserved, got %d", crop.Max.Y)
+	})
+
+	t.Run("US letter covering 94% of A4 bed with 1px ballpoint handwriting near edges", func(t *testing.T) {
+		// US Letter (8.5x11") on an A4 flatbed covers 100% width and 94% height (y=0..1222 of 1300)
+		bed := image.NewRGBA(image.Rect(0, 0, 1000, 1300))
+		lidColor := color.RGBA{R: 226, G: 224, B: 220, A: 255}
+		draw.Draw(bed, bed.Bounds(), &image.Uniform{C: lidColor}, image.Point{}, draw.Src)
+
+		paperColor := color.RGBA{R: 251, G: 250, B: 248, A: 255}
+		draw.Draw(bed, image.Rect(0, 0, 985, 1220), &image.Uniform{C: paperColor}, image.Point{}, draw.Src)
+
+		// 1-pixel ballpoint pen strokes near top (y=35) and right (x=955) margins
+		ink := color.RGBA{R: 50, G: 55, B: 70, A: 255}
+		for x := 60; x < 955; x += 40 {
+			bed.Set(x, 35, ink)
+			bed.Set(x, 36, ink)
+		}
+		for y := 40; y < 1160; y += 45 {
+			bed.Set(955, y, ink)
+			bed.Set(956, y, ink)
+		}
+
+		for _, agg := range []sane.CropAggression{sane.Crop10Pct, sane.Crop20Pct, sane.Crop30Pct} {
+			crop := sane.CalculateCropBoundsWithAggression(bed, agg)
+			final := sane.ApplyCropMarginWithAggression(bed.Bounds(), crop, 300, agg)
+			assert.Equal(t, 0, final.Min.X, "aggression %s clipped left edge", agg)
+			assert.Equal(t, 0, final.Min.Y, "aggression %s clipped top edge", agg)
+			assert.True(t, final.Max.X >= 980, "aggression %s clipped right paper edge (got %d)", agg, final.Max.X)
+			assert.True(t, final.Max.Y >= 1215 && final.Max.Y <= 1285, "aggression %s unexpected bottom edge %d", agg, final.Max.Y)
+		}
+	})
+}
+
+func TestCropAggressionPresets(t *testing.T) {
+	bounds := image.Rect(0, 0, 1000, 1000)
+	crop := image.Rect(100, 100, 600, 700)
+
+	off := sane.ApplyCropMarginWithAggression(bounds, crop, 300, sane.CropOff)
+	cons := sane.ApplyCropMarginWithAggression(bounds, crop, 300, sane.CropConservative)
+	bal := sane.ApplyCropMarginWithAggression(bounds, crop, 300, sane.CropBalanced)
+	agg := sane.ApplyCropMarginWithAggression(bounds, crop, 300, sane.CropAggressive)
+
+	assert.Equal(t, bounds, off)
+	// Conservative leaves the widest margin; Aggressive leaves the tightest margin.
+	assert.True(t, cons.Dx() > bal.Dx(), "conservative width (%d) should exceed balanced (%d)", cons.Dx(), bal.Dx())
+	assert.True(t, bal.Dx() > agg.Dx(), "balanced width (%d) should exceed aggressive (%d)", bal.Dx(), agg.Dx())
+	assert.Equal(t, sane.CropOff, sane.ParseCropAggression("off"))
+	assert.Equal(t, sane.Crop20Pct, sane.ParseCropAggression("low"))
+	assert.Equal(t, sane.Crop30Pct, sane.ParseCropAggression("medium"))
+	assert.Equal(t, sane.Crop80Pct, sane.ParseCropAggression("high"))
+	assert.Equal(t, sane.Crop50Pct, sane.ParseCropAggression("50%"))
+	assert.Equal(t, sane.Crop100Pct, sane.ParseCropAggression("100%"))
 }
 
 func TestApplyCropMargin(t *testing.T) {

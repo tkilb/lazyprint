@@ -77,12 +77,18 @@ type scannerCapsMsg struct {
 	caps   sane.Capabilities
 }
 
+type scannerCacheMsg struct {
+	cache sane.ScannerCache
+	fresh bool
+}
+
 // Model is the main application model.
 type Model struct {
-	Config config.Config
-	Runner runner.Runner
-	CUPS   *cups.Client
-	SANE   *sane.Client
+	Config           config.Config
+	Runner           runner.Runner
+	CUPS             *cups.Client
+	SANE             *sane.Client
+	ScannerCachePath string
 
 	Width  int
 	Height int
@@ -116,16 +122,17 @@ type Model struct {
 	RenameInput  textinput.Model
 
 	// Scanning modal & progress
-	ScanModal          *scanmodal.Model
-	ScanningModal      bool
-	Scanning           bool
-	ScanningText       string
-	Spinner            spinner.Model
-	LastScanResolution int
-	LastScanFormat     string
-	LastScanSource     string
-	LastScanMode       string
-	LastScanAutoCrop   bool
+	ScanModal              *scanmodal.Model
+	ScanningModal          bool
+	Scanning               bool
+	ScanningText           string
+	Spinner                spinner.Model
+	LastScanResolution     int
+	LastScanFormat         string
+	LastScanSource         string
+	LastScanMode           string
+	LastScanAutoCrop       bool
+	LastScanCropAggression string
 }
 
 // NewModel creates an initialized Model with the provided configuration and runner.
@@ -144,27 +151,42 @@ func NewModel(cfg config.Config, r runner.Runner) Model {
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 
+	cachePath := sane.DefaultCachePath()
+	var cachedScanners []sane.Device
+	scannerCaps := make(map[string]sane.Capabilities)
+	loadingScanners := true
+	if cache, err := sane.LoadCache(cachePath); err == nil && len(cache.Devices) > 0 {
+		cachedScanners = cache.Devices
+		for dev, caps := range cache.Capabilities {
+			scannerCaps[dev] = caps
+		}
+		loadingScanners = false
+	}
+
 	return Model{
-		Config:             cfg,
-		Runner:             r,
-		CUPS:               cupsClient,
-		SANE:               saneClient,
-		Width:              100,
-		Height:             30,
-		Focus:              statusbar.PanelPrinters,
-		StatusBar:          statusbar.New(),
-		PrinterOptions:     make(map[string][]cups.PrinterOption),
-		ScannerCaps:        make(map[string]sane.Capabilities),
-		LoadingPrinters:    true,
-		LoadingJobs:        true,
-		LoadingScanners:    true,
-		RenameInput:        ti,
-		Spinner:            sp,
-		LastScanResolution: cfg.Scan.DefaultResolution,
-		LastScanFormat:     cfg.Scan.DefaultFormat,
-		LastScanSource:     cfg.Scan.DefaultSource,
-		LastScanMode:       cfg.Scan.DefaultMode,
-		LastScanAutoCrop:   cfg.Scan.AutoCrop,
+		Config:                 cfg,
+		Runner:                 r,
+		CUPS:                   cupsClient,
+		SANE:                   saneClient,
+		ScannerCachePath:       cachePath,
+		Width:                  100,
+		Height:                 30,
+		Focus:                  statusbar.PanelPrinters,
+		StatusBar:              statusbar.New(),
+		Scanners:               cachedScanners,
+		PrinterOptions:         make(map[string][]cups.PrinterOption),
+		ScannerCaps:            scannerCaps,
+		LoadingPrinters:        true,
+		LoadingJobs:            true,
+		LoadingScanners:        loadingScanners,
+		RenameInput:            ti,
+		Spinner:                sp,
+		LastScanResolution:     cfg.Scan.DefaultResolution,
+		LastScanFormat:         cfg.Scan.DefaultFormat,
+		LastScanSource:         cfg.Scan.DefaultSource,
+		LastScanMode:           cfg.Scan.DefaultMode,
+		LastScanAutoCrop:       cfg.Scan.AutoCrop,
+		LastScanCropAggression: cfg.Scan.CropAggression,
 	}
 }
 
@@ -174,8 +196,31 @@ func (m Model) Init() tea.Cmd {
 		m.Spinner.Tick,
 		m.fetchPrintersCmd(),
 		m.fetchJobsCmd(),
-		m.fetchScannersCmd(),
+		m.initScannersCmd(),
 	)
+}
+
+func (m Model) initScannersCmd() tea.Cmd {
+	if m.ScannerCachePath != "" {
+		if cache, err := sane.LoadCache(m.ScannerCachePath); err == nil && len(cache.Devices) > 0 {
+			fresh := cache.IsFresh(sane.DefaultCacheTTL, time.Now())
+			return func() tea.Msg {
+				return scannerCacheMsg{cache: cache, fresh: fresh}
+			}
+		}
+	}
+	return m.fetchScannersCmd()
+}
+
+func (m Model) saveScannerCache() {
+	if m.ScannerCachePath == "" || len(m.Scanners) == 0 {
+		return
+	}
+	_ = sane.SaveCache(m.ScannerCachePath, sane.ScannerCache{
+		UpdatedAt:    time.Now(),
+		Devices:      m.Scanners,
+		Capabilities: m.ScannerCaps,
+	})
 }
 
 func (m Model) fetchPrintersCmd() tea.Cmd {
@@ -267,6 +312,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case scannerCacheMsg:
+		m.LoadingScanners = false
+		m.Scanners = msg.cache.Devices
+		for dev, caps := range msg.cache.Capabilities {
+			m.ScannerCaps[dev] = caps
+		}
+		if m.ScannerCursor >= len(m.Scanners) {
+			m.ScannerCursor = max(0, len(m.Scanners)-1)
+		}
+		for _, dev := range m.Scanners {
+			if _, ok := m.ScannerCaps[dev.Device]; !ok {
+				cmds = append(cmds, m.fetchScannerCapsCmd(dev.Device))
+			}
+		}
+
 	case scannersMsg:
 		m.LoadingScanners = false
 		if msg.err != nil {
@@ -276,12 +336,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.ScannerCursor >= len(m.Scanners) {
 				m.ScannerCursor = max(0, len(m.Scanners)-1)
 			}
-			if len(m.Scanners) > 0 {
-				selected := m.Scanners[m.ScannerCursor].Device
-				if _, ok := m.ScannerCaps[selected]; !ok {
-					cmds = append(cmds, m.fetchScannerCapsCmd(selected))
+			for _, dev := range m.Scanners {
+				if _, ok := m.ScannerCaps[dev.Device]; !ok {
+					cmds = append(cmds, m.fetchScannerCapsCmd(dev.Device))
 				}
 			}
+			m.saveScannerCache()
 		}
 
 	case printerOptionsMsg:
@@ -291,6 +351,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case scannerCapsMsg:
 		m.ScannerCaps[msg.device] = msg.caps
+		m.saveScannerCache()
 
 	case actionCompletedMsg:
 		if msg.err != nil {
@@ -366,6 +427,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.LastScanSource = req.Source
 				m.LastScanMode = req.Mode
 				m.LastScanAutoCrop = req.AutoCrop
+				m.LastScanCropAggression = req.CropAggression
 				m.ScanningModal = false
 				return m, nil
 			case "enter":
@@ -375,6 +437,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.LastScanSource = req.Source
 				m.LastScanMode = req.Mode
 				m.LastScanAutoCrop = req.AutoCrop
+				m.LastScanCropAggression = req.CropAggression
 				m.ScanningModal = false
 				return m, m.startScanCmd(req)
 			default:
@@ -386,6 +449,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.LastScanSource = req.Source
 				m.LastScanMode = req.Mode
 				m.LastScanAutoCrop = req.AutoCrop
+				m.LastScanCropAggression = req.CropAggression
 				if !keepOpen {
 					m.ScanningModal = false
 					return m, nil
@@ -416,6 +480,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.LoadingPrinters = true
 			m.LoadingJobs = true
 			m.LoadingScanners = true
+			m.ScannerCaps = make(map[string]sane.Capabilities)
 			m.StatusBar.SetMessage("Refreshing devices...", false)
 			cmds = append(cmds, m.fetchPrintersCmd(), m.fetchJobsCmd(), m.fetchScannersCmd(), m.Spinner.Tick)
 
@@ -463,7 +528,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.Focus == statusbar.PanelScanners && len(m.Scanners) > 0 {
 				dev := m.Scanners[m.ScannerCursor]
 				caps := m.ScannerCaps[dev.Device]
-				sm := scanmodal.New(dev, caps, m.Config, m.LastScanResolution, m.LastScanFormat, m.LastScanSource, m.LastScanMode, m.LastScanAutoCrop, time.Now())
+				sm := scanmodal.New(dev, caps, m.Config, m.LastScanResolution, m.LastScanFormat, m.LastScanSource, m.LastScanMode, m.LastScanAutoCrop, time.Now()).WithAggression(m.LastScanCropAggression)
 				m.ScanModal = &sm
 				m.ScanningModal = true
 			}
@@ -491,13 +556,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				outPath := sane.BuildDefaultOutputPath(m.Config.Scan.SaveDir, format, time.Now())
 				req := sane.ScanRequest{
-					Device:     dev.Device,
-					Resolution: res,
-					Source:     "Flatbed",
-					Mode:       mode,
-					Format:     format,
-					OutputPath: outPath,
-					AutoCrop:   m.LastScanAutoCrop,
+					Device:         dev.Device,
+					Resolution:     res,
+					Source:         "Flatbed",
+					Mode:           mode,
+					Format:         format,
+					OutputPath:     outPath,
+					AutoCrop:       m.LastScanAutoCrop,
+					CropAggression: m.LastScanCropAggression,
 				}
 				return m, m.startScanCmd(req)
 			}
@@ -530,13 +596,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				outPath := sane.BuildDefaultOutputPath(m.Config.Scan.SaveDir, format, time.Now())
 				req := sane.ScanRequest{
-					Device:     dev.Device,
-					Resolution: res,
-					Source:     "ADF",
-					Mode:       mode,
-					Format:     format,
-					OutputPath: outPath,
-					AutoCrop:   m.LastScanAutoCrop,
+					Device:         dev.Device,
+					Resolution:     res,
+					Source:         "ADF",
+					Mode:           mode,
+					Format:         format,
+					OutputPath:     outPath,
+					AutoCrop:       m.LastScanAutoCrop,
+					CropAggression: m.LastScanCropAggression,
 				}
 				return m, m.startScanCmd(req)
 			}

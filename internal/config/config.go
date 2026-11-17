@@ -24,6 +24,7 @@ const (
 	DefaultScanDirResolution = 300
 	DefaultScanFormat        = "png"
 	DefaultScanSource        = "flatbed"
+	DefaultCropAggression    = "30%"
 	DefaultPrintCopies       = 1
 	DefaultPrintDuplex       = "off"
 )
@@ -54,6 +55,9 @@ type ScanConfig struct {
 
 	// AutoCrop automatically trims blank margins around scanned items. Defaults to true.
 	AutoCrop bool `yaml:"auto_crop"`
+
+	// CropAggression controls how tightly auto-crop trims the scanner base ("off", "conservative", "balanced", "aggressive"). Defaults to "balanced".
+	CropAggression string `yaml:"crop_aggression"`
 }
 
 // PrintConfig defines printing preferences.
@@ -87,6 +91,7 @@ func Default() Config {
 			DefaultSource:     DefaultScanSource,
 			DefaultMode:       "Color",
 			AutoCrop:          true,
+			CropAggression:    DefaultCropAggression,
 		},
 		Print: PrintConfig{
 			DefaultCopies: DefaultPrintCopies,
@@ -180,6 +185,37 @@ func NormalizeFormat(f string) string {
 	}
 }
 
+// NormalizeCropAggression standardizes crop aggression values and aliases
+// to canonical values ("off", "10%", "20%", ..., "100%").
+func NormalizeCropAggression(a string) string {
+	switch strings.ToLower(strings.TrimSpace(a)) {
+	case "off", "none", "false", "disabled", "0", "0%":
+		return "off"
+	case "10%", "10":
+		return "10%"
+	case "20%", "20", "conservative", "low", "gentle", "safe":
+		return "20%"
+	case "30%", "30", "balanced", "medium", "normal", "default", "":
+		return "30%"
+	case "40%", "40":
+		return "40%"
+	case "50%", "50":
+		return "50%"
+	case "60%", "60":
+		return "60%"
+	case "70%", "70":
+		return "70%"
+	case "80%", "80", "aggressive", "high", "tight", "strict":
+		return "80%"
+	case "90%", "90":
+		return "90%"
+	case "100%", "100":
+		return "100%"
+	default:
+		return DefaultCropAggression
+	}
+}
+
 // LoadFromReader parses YAML configuration from an io.Reader and merges onto defaults.
 func LoadFromReader(r io.Reader) (Config, error) {
 	cfg := Default()
@@ -190,5 +226,9 @@ func LoadFromReader(r io.Reader) (Config, error) {
 
 	cfg.Scan.SaveDir = ExpandHome(cfg.Scan.SaveDir)
 	cfg.Scan.DefaultFormat = NormalizeFormat(cfg.Scan.DefaultFormat)
+	cfg.Scan.CropAggression = NormalizeCropAggression(cfg.Scan.CropAggression)
+	if cfg.Scan.CropAggression == "off" {
+		cfg.Scan.AutoCrop = false
+	}
 	return cfg, nil
 }

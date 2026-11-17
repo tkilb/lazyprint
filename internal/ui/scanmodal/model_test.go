@@ -64,11 +64,30 @@ func TestScanModal_NavigationAndRequest(t *testing.T) {
 
 	// Tab to AutoCrop
 	m, _, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
-	// Toggle AutoCrop with space -> false
+	// Toggle AutoCrop with space -> false (syncs Aggression to "off")
 	m, _, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
 	assert.False(t, m.Request().AutoCrop)
-	// Toggle AutoCrop with 'l' -> true
+	assert.Equal(t, "off", m.Request().CropAggression)
+	// Toggle AutoCrop with 'l' -> true (restores "30%")
 	m, _, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	assert.True(t, m.Request().AutoCrop)
+	assert.Equal(t, "30%", m.Request().CropAggression)
+
+	// Tab to Aggression (para-style chooser)
+	m, _, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	// Type '8' to jump to "80%"
+	m, _, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("8")})
+	assert.Equal(t, "80%", m.Request().CropAggression)
+	assert.True(t, m.Request().AutoCrop)
+
+	// Type Backspace to clear typed and reset to "off" (syncs AutoCrop to false)
+	m, _, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	assert.Equal(t, "off", m.Request().CropAggression)
+	assert.False(t, m.Request().AutoCrop)
+
+	// Type '2' to jump to "20%" (syncs AutoCrop back to true)
+	m, _, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")})
+	assert.Equal(t, "20%", m.Request().CropAggression)
 	assert.True(t, m.Request().AutoCrop)
 
 	// Tab to Path
@@ -98,6 +117,9 @@ func TestScanModal_View(t *testing.T) {
 	assert.Contains(t, view, "300 DPI")
 	assert.Contains(t, view, "Color Mode:")
 	assert.Contains(t, view, "Auto-Crop:")
+	assert.Contains(t, view, "Aggression:")
+	assert.Contains(t, view, "30%")
+	assert.Contains(t, view, "Default trim; safe document margin")
 	assert.Contains(t, view, "Destination file:")
 }
 

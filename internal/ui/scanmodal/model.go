@@ -1,4 +1,5 @@
-// Package scanmodal provides an interactive scan configuration modal.
+// Package scanmodal provides an interactive scan configuration modal with
+// para-style chooser fields and type-to-select support.
 package scanmodal
 
 import (
@@ -6,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -22,10 +24,11 @@ const (
 	fieldMode
 	fieldFormat
 	fieldAutoCrop
+	fieldAggression
 	fieldPath
-)
 
-const maxFields = 6
+	maxFields
+)
 
 // Model represents the interactive scan modal form.
 type Model struct {
@@ -33,16 +36,20 @@ type Model struct {
 	Capabilities sane.Capabilities
 	Config       config.Config
 
-	Sources       []string
-	SourceIdx     int
-	Resolutions   []int
-	ResolutionIdx int
-	Modes         []string
-	ModeIdx       int
-	Formats       []string
-	FormatIdx     int
-	AutoCrop      bool
+	Sources          []string
+	SourceIdx        int
+	Resolutions      []int
+	ResolutionIdx    int
+	Modes            []string
+	ModeIdx          int
+	Formats          []string
+	FormatIdx        int
+	AutoCrop         bool
+	Aggressions      []sane.CropAggression
+	AggressionIdx    int
+	lastNonOffAggIdx int
 
+	typed     string
 	PathInput textinput.Model
 	Active    fieldID
 	Width     int
@@ -127,31 +134,79 @@ func New(dev sane.Device, caps sane.Capabilities, cfg config.Config, prefRes int
 		}
 	}
 
+	aggressions := sane.CropAggressions()
+	aggIdx := 3 // Crop30Pct ("30%")
+	lastNonOff := 3
+	targetAgg := sane.ParseCropAggression(cfg.Scan.CropAggression)
+	for i, a := range aggressions {
+		if a == targetAgg {
+			aggIdx = i
+			if a != sane.CropOff {
+				lastNonOff = i
+			}
+			break
+		}
+	}
+	if !prefAutoCrop {
+		aggIdx = 0
+	} else if aggIdx == 0 {
+		aggIdx = lastNonOff
+	}
+
 	// Default path
 	defaultPath := sane.BuildDefaultOutputPath(cfg.Scan.SaveDir, formats[fmtIdx], now)
 
 	ti := textinput.New()
 	ti.SetValue(defaultPath)
 	ti.CharLimit = 256
-	ti.Width = 40
+	ti.Width = 44
 
 	return Model{
-		Device:        dev,
-		Capabilities:  caps,
-		Config:        cfg,
-		Sources:       sources,
-		SourceIdx:     srcIdx,
-		Resolutions:   resolutions,
-		ResolutionIdx: resIdx,
-		Modes:         modes,
-		ModeIdx:       modeIdx,
-		Formats:       formats,
-		FormatIdx:     fmtIdx,
-		AutoCrop:      prefAutoCrop,
-		PathInput:     ti,
-		Active:        fieldSource,
-		Width:         60,
+		Device:           dev,
+		Capabilities:     caps,
+		Config:           cfg,
+		Sources:          sources,
+		SourceIdx:        srcIdx,
+		Resolutions:      resolutions,
+		ResolutionIdx:    resIdx,
+		Modes:            modes,
+		ModeIdx:          modeIdx,
+		Formats:          formats,
+		FormatIdx:        fmtIdx,
+		AutoCrop:         prefAutoCrop,
+		Aggressions:      aggressions,
+		AggressionIdx:    aggIdx,
+		lastNonOffAggIdx: lastNonOff,
+		PathInput:        ti,
+		Active:           fieldSource,
+		Width:            68,
 	}
+}
+
+// WithAggression sets the preferred crop aggression preset on the modal, keeping AutoCrop synced.
+func (m Model) WithAggression(prefAggression string) Model {
+	if strings.TrimSpace(prefAggression) == "" {
+		return m
+	}
+	target := sane.ParseCropAggression(prefAggression)
+	for i, a := range m.Aggressions {
+		if a == target {
+			if a != sane.CropOff {
+				m.lastNonOffAggIdx = i
+			}
+			if m.AutoCrop {
+				if a == sane.CropOff {
+					m.AggressionIdx = m.lastNonOffAggIdx
+				} else {
+					m.AggressionIdx = i
+				}
+			} else {
+				m.AggressionIdx = 0
+			}
+			break
+		}
+	}
+	return m
 }
 
 // Request builds the finalized sane.ScanRequest.
@@ -173,23 +228,30 @@ func (m Model) Request() sane.ScanRequest {
 		format = m.Formats[m.FormatIdx]
 	}
 
+	agg := sane.CropDefault
+	if len(m.Aggressions) > 0 && m.AggressionIdx >= 0 && m.AggressionIdx < len(m.Aggressions) {
+		agg = m.Aggressions[m.AggressionIdx]
+	}
+	autoCrop := m.AutoCrop && agg != sane.CropOff
+
 	outPath := strings.TrimSpace(m.PathInput.Value())
 	if outPath == "" {
 		outPath = sane.BuildDefaultOutputPath(m.Config.Scan.SaveDir, format, time.Now())
 	}
 
 	return sane.ScanRequest{
-		Device:     m.Device.Device,
-		Resolution: res,
-		Source:     source,
-		Mode:       mode,
-		Format:     format,
-		OutputPath: outPath,
-		AutoCrop:   m.AutoCrop,
+		Device:         m.Device.Device,
+		Resolution:     res,
+		Source:         source,
+		Mode:           mode,
+		Format:         format,
+		OutputPath:     outPath,
+		AutoCrop:       autoCrop,
+		CropAggression: agg.String(),
 	}
 }
 
-// Update handles modal keyboard navigation.
+// Update handles modal keyboard navigation, left/right cycling, and para-style type-to-select.
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd, bool) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -199,6 +261,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd, bool) {
 
 		case "tab", "down":
 			m.Active = (m.Active + 1) % maxFields
+			m.typed = ""
 			if m.Active == fieldPath {
 				m.PathInput.Focus()
 			} else {
@@ -208,6 +271,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd, bool) {
 
 		case "shift+tab", "up":
 			m.Active = (m.Active - 1 + maxFields) % maxFields
+			m.typed = ""
 			if m.Active == fieldPath {
 				m.PathInput.Focus()
 			} else {
@@ -217,19 +281,26 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd, bool) {
 
 		case "h", "left":
 			if m.Active != fieldPath {
+				m.typed = ""
 				m.cycleLeft()
 				return m, nil, true
 			}
 
 		case "l", "right":
 			if m.Active != fieldPath {
+				m.typed = ""
 				m.cycleRight()
 				return m, nil, true
 			}
 
 		case " ":
 			if m.Active == fieldAutoCrop {
-				m.AutoCrop = !m.AutoCrop
+				m.typed = ""
+				m.setAutoCrop(!m.AutoCrop)
+				return m, nil, true
+			} else if m.Active == fieldAggression {
+				m.typed = ""
+				m.cycleRight()
 				return m, nil, true
 			}
 		}
@@ -239,9 +310,38 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd, bool) {
 			m.PathInput, cmd = m.PathInput.Update(msg)
 			return m, cmd, true
 		}
+
+		m.handleChooserTypeSelect(msg)
+		return m, nil, true
 	}
 
 	return m, nil, true
+}
+
+func (m *Model) setAutoCrop(enabled bool) {
+	m.AutoCrop = enabled
+	if !enabled {
+		m.AggressionIdx = 0
+	} else if m.AggressionIdx == 0 {
+		if m.lastNonOffAggIdx > 0 && m.lastNonOffAggIdx < len(m.Aggressions) {
+			m.AggressionIdx = m.lastNonOffAggIdx
+		} else {
+			m.AggressionIdx = 3
+		}
+	}
+}
+
+func (m *Model) syncFromAggression() {
+	if len(m.Aggressions) == 0 {
+		return
+	}
+	agg := m.Aggressions[m.AggressionIdx]
+	if agg == sane.CropOff {
+		m.AutoCrop = false
+	} else {
+		m.AutoCrop = true
+		m.lastNonOffAggIdx = m.AggressionIdx
+	}
 }
 
 func (m *Model) cycleLeft() {
@@ -264,7 +364,12 @@ func (m *Model) cycleLeft() {
 			m.syncPathExtension()
 		}
 	case fieldAutoCrop:
-		m.AutoCrop = !m.AutoCrop
+		m.setAutoCrop(!m.AutoCrop)
+	case fieldAggression:
+		if len(m.Aggressions) > 1 {
+			m.AggressionIdx = (m.AggressionIdx - 1 + len(m.Aggressions)) % len(m.Aggressions)
+			m.syncFromAggression()
+		}
 	}
 }
 
@@ -288,8 +393,100 @@ func (m *Model) cycleRight() {
 			m.syncPathExtension()
 		}
 	case fieldAutoCrop:
-		m.AutoCrop = !m.AutoCrop
+		m.setAutoCrop(!m.AutoCrop)
+	case fieldAggression:
+		if len(m.Aggressions) > 1 {
+			m.AggressionIdx = (m.AggressionIdx + 1) % len(m.Aggressions)
+			m.syncFromAggression()
+		}
 	}
+}
+
+// handleChooserTypeSelect implements para's typeSelect behavior on chooser fields:
+// typing letters jumps to the matching option prefix, and Backspace clears/resets.
+func (m *Model) handleChooserTypeSelect(key tea.KeyMsg) {
+	switch m.Active {
+	case fieldSource:
+		m.SourceIdx, m.typed = typeSelect(key, m.Sources, m.SourceIdx, m.typed, 0)
+	case fieldResolution:
+		labels := make([]string, len(m.Resolutions))
+		for i, r := range m.Resolutions {
+			labels[i] = fmt.Sprintf("%d", r)
+		}
+		m.ResolutionIdx, m.typed = typeSelect(key, labels, m.ResolutionIdx, m.typed, 0)
+	case fieldMode:
+		m.ModeIdx, m.typed = typeSelect(key, m.Modes, m.ModeIdx, m.typed, 0)
+	case fieldFormat:
+		prev := m.FormatIdx
+		m.FormatIdx, m.typed = typeSelect(key, m.Formats, m.FormatIdx, m.typed, 0)
+		if m.FormatIdx != prev {
+			m.syncPathExtension()
+		}
+	case fieldAutoCrop:
+		labels := []string{"No", "Yes"}
+		idx := 0
+		if m.AutoCrop {
+			idx = 1
+		}
+		nextIdx, nextTyped := typeSelect(key, labels, idx, m.typed, 0)
+		m.typed = nextTyped
+		if nextIdx != idx {
+			m.setAutoCrop(nextIdx == 1)
+		}
+	case fieldAggression:
+		labels := make([]string, len(m.Aggressions))
+		for i, a := range m.Aggressions {
+			labels[i] = a.String()
+		}
+		// Like para's Kind chooser, Backspace clears to index 0 (off) and typing searches presets from index 1 first
+		from := 1
+		if key.Type == tea.KeyRunes {
+			next := strings.ToLower(m.typed + string(key.Runes))
+			if strings.HasPrefix("off", next) {
+				from = 0
+			} else if next == "0" {
+				m.AggressionIdx = 0
+				m.typed = "0"
+				m.syncFromAggression()
+				return
+			}
+		}
+		prev := m.AggressionIdx
+		m.AggressionIdx, m.typed = typeSelect(key, labels, m.AggressionIdx, m.typed, from)
+		if m.AggressionIdx != prev {
+			m.syncFromAggression()
+		}
+	}
+}
+
+func typeSelect(key tea.KeyMsg, labels []string, idx int, typed string, from int) (int, string) {
+	switch {
+	case key.Type == tea.KeyBackspace:
+		if typed != "" {
+			_, size := utf8.DecodeLastRuneInString(typed)
+			typed = typed[:len(typed)-size]
+		}
+		if typed == "" {
+			return 0, ""
+		}
+		return matchLabel(labels, typed, idx, from), typed
+	case key.Type == tea.KeyRunes && !key.Alt:
+		next := typed + strings.ToLower(string(key.Runes))
+		if i := matchLabel(labels, next, -1, from); i >= 0 {
+			return i, next
+		}
+		return idx, typed
+	}
+	return idx, typed
+}
+
+func matchLabel(labels []string, prefix string, fallback, from int) int {
+	for i := from; i < len(labels); i++ {
+		if strings.HasPrefix(strings.ToLower(labels[i]), prefix) {
+			return i
+		}
+	}
+	return fallback
 }
 
 func (m *Model) syncPathExtension() {
@@ -304,23 +501,32 @@ func (m *Model) syncPathExtension() {
 	}
 }
 
-// View renders the scan modal dialog.
+// View renders the scan modal dialog with para-style chooser lines.
 func (m Model) View() string {
-	boxWidth := 56
+	boxWidth := 68
 	if m.Width > 0 && m.Width-6 < boxWidth {
-		boxWidth = max(34, m.Width-6)
+		boxWidth = max(38, m.Width-6)
 	}
 
 	accent := lipgloss.Color("2")
 	focusedStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("4"))
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 
-	formatChoice := func(val string, active bool) string {
-		str := fmt.Sprintf("‹ %s ›", val)
+	formatChoice := func(val, meaning string, active bool) string {
+		var renderedVal string
 		if active {
-			return focusedStyle.Render(str)
+			renderedVal = focusedStyle.Render(" " + val + " ")
+		} else {
+			renderedVal = lipgloss.NewStyle().Bold(true).Render(val)
 		}
-		return str
+		suffix := ""
+		if meaning != "" {
+			suffix += "  " + meaning
+		}
+		if active && m.typed != "" {
+			suffix += "  [" + m.typed + "]"
+		}
+		return dimStyle.Render("‹ ") + renderedVal + dimStyle.Render(" ›"+suffix)
 	}
 
 	titleText := m.Device.Model
@@ -334,35 +540,44 @@ func (m Model) View() string {
 	if len(m.Sources) > 0 {
 		sourceVal = m.Sources[m.SourceIdx]
 	}
-	sourceStr := formatChoice(sourceVal, m.Active == fieldSource)
+	sourceStr := formatChoice(sourceVal, "", m.Active == fieldSource)
 
 	// Resolution row
 	resVal := "300 DPI"
 	if len(m.Resolutions) > 0 {
 		resVal = fmt.Sprintf("%d DPI", m.Resolutions[m.ResolutionIdx])
 	}
-	resStr := formatChoice(resVal, m.Active == fieldResolution)
+	resStr := formatChoice(resVal, "", m.Active == fieldResolution)
 
 	// Mode row
 	modeVal := "Color"
 	if len(m.Modes) > 0 {
 		modeVal = m.Modes[m.ModeIdx]
 	}
-	modeStr := formatChoice(modeVal, m.Active == fieldMode)
+	modeStr := formatChoice(modeVal, "", m.Active == fieldMode)
 
 	// Format row
 	fmtVal := "PDF"
 	if len(m.Formats) > 0 {
 		fmtVal = strings.ToUpper(m.Formats[m.FormatIdx])
 	}
-	fmtStr := formatChoice(fmtVal, m.Active == fieldFormat)
+	fmtStr := formatChoice(fmtVal, "", m.Active == fieldFormat)
 
 	// AutoCrop row
 	cropVal := "No"
+	cropMeaning := "Keep full scanner bed"
 	if m.AutoCrop {
 		cropVal = "Yes"
+		cropMeaning = "Trim empty scanner bed"
 	}
-	cropStr := formatChoice(cropVal, m.Active == fieldAutoCrop)
+	cropStr := formatChoice(cropVal, cropMeaning, m.Active == fieldAutoCrop)
+
+	// Aggression row (para-style chooser with meaning + typeSelect, no foreground color)
+	agg := sane.CropDefault
+	if len(m.Aggressions) > 0 && m.AggressionIdx >= 0 && m.AggressionIdx < len(m.Aggressions) {
+		agg = m.Aggressions[m.AggressionIdx]
+	}
+	aggStr := formatChoice(agg.String(), agg.Meaning(), m.Active == fieldAggression)
 
 	// Path row
 	pathPrompt := "  "
@@ -371,7 +586,7 @@ func (m Model) View() string {
 	}
 	pathStr := pathPrompt + m.PathInput.View()
 
-	hint := dimStyle.Render("tab: next field  h/l: cycle  enter: scan  esc: cancel")
+	hint := dimStyle.Render("(type) jump  (←/→) change  (⌫) reset  (tab) move  (enter) scan")
 
 	body := lipgloss.JoinVertical(lipgloss.Left,
 		header,
@@ -381,6 +596,7 @@ func (m Model) View() string {
 		fmt.Sprintf("Color Mode:  %s", modeStr),
 		fmt.Sprintf("Format:      %s", fmtStr),
 		fmt.Sprintf("Auto-Crop:   %s", cropStr),
+		fmt.Sprintf("Aggression:  %s", aggStr),
 		"",
 		"Destination file:",
 		pathStr,

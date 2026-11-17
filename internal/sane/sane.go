@@ -37,13 +37,14 @@ type Capabilities struct {
 
 // ScanRequest defines parameters for a scan operation.
 type ScanRequest struct {
-	Device     string `json:"device"`
-	Resolution int    `json:"resolution"`
-	Source     string `json:"source"` // e.g. "Flatbed", "ADF"
-	Format     string `json:"format"` // "pdf", "png", "jpeg"
-	Mode       string `json:"mode"`   // "Color", "Gray"
-	OutputPath string `json:"output_path"`
-	AutoCrop   bool   `json:"auto_crop"`
+	Device         string `json:"device"`
+	Resolution     int    `json:"resolution"`
+	Source         string `json:"source"` // e.g. "Flatbed", "ADF"
+	Format         string `json:"format"` // "pdf", "png", "jpeg"
+	Mode           string `json:"mode"`   // "Color", "Gray"
+	OutputPath     string `json:"output_path"`
+	AutoCrop       bool   `json:"auto_crop"`
+	CropAggression string `json:"crop_aggression"` // "off", "conservative", "balanced", "aggressive"
 }
 
 // Client wraps SANE CLI interactions using runner.Runner.
@@ -89,17 +90,20 @@ func (c *Client) Scan(ctx context.Context, req ScanRequest) error {
 	}
 
 	if req.AutoCrop && req.OutputPath != "" {
-		if err := c.AutoCrop(ctx, req.OutputPath, req.Resolution); err != nil {
-			return fmt.Errorf("autocrop failed: %w", err)
+		aggression := ParseCropAggression(req.CropAggression)
+		if aggression != CropOff {
+			if err := c.AutoCropFileWithAggression(ctx, req.OutputPath, req.Resolution, aggression); err != nil {
+				return fmt.Errorf("autocrop failed: %w", err)
+			}
 		}
 	}
 
 	return nil
 }
 
-// AutoCrop trims empty scanner bed margins around the scanned item.
+// AutoCrop trims empty scanner bed margins around the scanned item using balanced aggression.
 func (c *Client) AutoCrop(ctx context.Context, filePath string, resolution int) error {
-	return c.AutoCropFile(ctx, filePath, resolution)
+	return c.AutoCropFileWithAggression(ctx, filePath, resolution, CropBalanced)
 }
 
 // BuildAutoCropArgs constructs argv for trimming blank borders with magick or convert.

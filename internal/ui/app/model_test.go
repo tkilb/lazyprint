@@ -2,7 +2,9 @@ package app_test
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
@@ -314,4 +316,56 @@ func TestModel_ScanningActions_And_Modal(t *testing.T) {
 	assert.False(t, m.Scanning)
 	assert.Nil(t, cmd)
 	assert.Contains(t, m.StatusBar.Message, "does not support ADF")
+}
+
+func TestModel_ScannerCacheLoad(t *testing.T) {
+	cfg := config.Default()
+	mock := runner.NewMockRunner()
+	cachePath := filepath.Join(t.TempDir(), "scanners.json")
+
+	expectedDevs := []sane.Device{
+		{
+			Device: "airscan:e0:Brother HL-L2395DW series",
+			Vendor: "eSCL",
+			Model:  "Brother HL-L2395DW series",
+			Type:   "flatbed scanner",
+		},
+	}
+	expectedCaps := map[string]sane.Capabilities{
+		"airscan:e0:Brother HL-L2395DW series": {
+			Resolutions:       []int{100, 150, 200, 300, 600},
+			DefaultResolution: 300,
+			Sources:           []string{"Flatbed"},
+			DefaultSource:     "Flatbed",
+			Modes:             []string{"Color", "Gray"},
+			DefaultMode:       "Color",
+		},
+	}
+	require.NoError(t, sane.SaveCache(cachePath, sane.ScannerCache{
+		UpdatedAt:    time.Now(),
+		Devices:      expectedDevs,
+		Capabilities: expectedCaps,
+	}))
+
+	m := app.NewModel(cfg, mock)
+	m.ScannerCachePath = cachePath
+
+	initCmd := m.Init()
+	require.NotNil(t, initCmd)
+	batchMsg := initCmd()
+	batch, ok := batchMsg.(tea.BatchMsg)
+	require.True(t, ok)
+
+	for _, cmd := range batch {
+		if cmd == nil {
+			continue
+		}
+		msg := cmd()
+		mUpdated, _ := m.Update(msg)
+		m = mUpdated.(app.Model)
+	}
+
+	assert.False(t, m.LoadingScanners)
+	assert.Equal(t, expectedDevs, m.Scanners)
+	assert.Equal(t, expectedCaps["airscan:e0:Brother HL-L2395DW series"], m.ScannerCaps["airscan:e0:Brother HL-L2395DW series"])
 }

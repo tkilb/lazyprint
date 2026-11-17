@@ -18,6 +18,7 @@ func TestConfig_DefaultValues(t *testing.T) {
 	assert.Equal(t, "png", cfg.Scan.DefaultFormat)
 	assert.Equal(t, "flatbed", cfg.Scan.DefaultSource)
 	assert.True(t, cfg.Scan.AutoCrop)
+	assert.Equal(t, "30%", cfg.Scan.CropAggression)
 	assert.Equal(t, 1, cfg.Print.DefaultCopies)
 	assert.Equal(t, "off", cfg.Print.DefaultDuplex)
 	assert.True(t, cfg.UI.Mouse)
@@ -159,4 +160,35 @@ func TestConfig_ExpandHome(t *testing.T) {
 	assert.Equal(t, filepath.Join(home, "Documents"), config.ExpandHome("~/Documents"))
 	assert.Equal(t, home, config.ExpandHome("~"))
 	assert.Equal(t, "/var/log", config.ExpandHome("/var/log"))
+}
+
+func TestConfig_NormalizeCropAggression(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"off", "off"},
+		{"none", "off"},
+		{"0%", "off"},
+		{"10%", "10%"},
+		{"20%", "20%"},
+		{"30%", "30%"},
+		{"50%", "50%"},
+		{"80%", "80%"},
+		{"100%", "100%"},
+		{"conservative", "20%"},
+		{"low", "20%"},
+		{"balanced", "30%"},
+		{"medium", "30%"},
+		{"", "30%"},
+		{"aggressive", "80%"},
+		{"high", "80%"},
+		{"unknown", "30%"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			assert.Equal(t, tc.expected, config.NormalizeCropAggression(tc.input))
+		})
+	}
 }
